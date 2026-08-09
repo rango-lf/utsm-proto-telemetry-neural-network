@@ -51,12 +51,12 @@ from sklearn.ensemble import RandomForestRegressor
 # --------------------------------------------------------------------------
 
 FEATURE_COLUMNS = [
-    "speed",        # speed at this track position
-    "accel",        # acceleration at this track position
-    "slope",        # track slope/gradient at this position
-    "motor_temp",   # motor temperature at this position
-    "force_total",  # computed net force at this position
-    "wind_speed",   # wind speed (relative or absolute) at this position
+    "speed_m_s",              # speed in m/s
+    "accel_m_s2",             # acceleration in m/s^2
+    "grade_pct",              # grade/slope in percent
+    "imu_total_g",            # total acceleration in g
+    "power_w",                # power in watts
+    "cum_energy_wh",          # cumulative energy (for normalization/context)
 ]
 
 # Statistics computed per column to form the fixed-length input vector.
@@ -65,9 +65,8 @@ STAT_FUNCTIONS = ["mean", "max", "min", "std"]
 
 # How to obtain the regression target (actual total lap energy).
 # One of: "cumulative_column", "sum_column", "labels_file"
-TARGET_MODE = "labels_file"
-TARGET_COLUMN = "energy_cumulative_wh"  # used by cumulative_column / sum_column
-LABELS_FILE = "lap_labels.csv"          # used by labels_file (lives in data_dir)
+TARGET_MODE = "cumulative_column"
+TARGET_COLUMN = "cum_energy_wh"  # last value = total lap energy
 
 # Filename pattern produced by the pre-processing script
 FILENAME_PATTERN = re.compile(r"lap(\d+)_distgrid\.csv$", re.IGNORECASE)
@@ -92,7 +91,7 @@ def discover_lap_files(data_dir):
 
 def feature_names():
     """Return the ordered list of feature names for the input vector.
-    e.g. ["speed_mean", "speed_max", ..., "wind_speed_std"]
+    e.g. ["speed_m_s_mean", "speed_m_s_max", ..., "cum_energy_wh_std"]
     Used by evaluate.py to label the feature importance chart."""
     return [f"{col}_{stat}" for col in FEATURE_COLUMNS for stat in STAT_FUNCTIONS]
 
