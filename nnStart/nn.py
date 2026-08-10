@@ -11,6 +11,76 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 import os
 
+#validate raw data and ensure that it is correct
+def validate_telemetry(df, source_name):
+    required_columns = [
+        "timestamp_ms",
+        "current_mA",
+        "voltage_mV",
+        "ax_x100",
+        "ay_x100",
+        "az_x100",
+        "amag_x100",
+    ]
+
+    if df.empty:
+        raise ValueError(f"{source_name}: file contains no telemetry rows")
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"{source_name}: missing required columns "
+            f"{missing_columns}"
+        )
+
+    if df.columns.duplicated().any():
+        duplicates = df.columns[df.columns.duplicated()].tolist()
+        raise ValueError(
+            f"{source_name}: duplicate columns {duplicates}"
+        )
+
+    for column in required_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    numeric_values = df[required_columns].to_numpy(
+        dtype=np.float64
+    )
+
+    invalid_rows = ~np.isfinite(numeric_values).all(axis=1)
+
+    if invalid_rows.any():
+        csv_rows = (df.index[invalid_rows] + 2).tolist()
+        raise ValueError(
+            f"{source_name}: missing or invalid values "
+            f"at CSV rows {csv_rows[:20]}"
+        )
+
+    if df["timestamp_ms"].duplicated().any():
+        raise ValueError(
+            f"{source_name}: timestamps contain duplicates"
+        )
+
+    if not df["timestamp_ms"].is_monotonic_increasing:
+        raise ValueError(
+            f"{source_name}: timestamps must be increasing"
+        )
+
+    if (df["voltage_mV"] <= 0).any():
+        raise ValueError(
+            f"{source_name}: voltage must be greater than zero"
+        )
+
+    return df
+
+
 # ==========================================
 # 1. DEFINE THE ANN (FEEDFORWARD MLP)
 # ==========================================
@@ -37,44 +107,41 @@ class TelemetryStrategyNet(nn.Module):
         return out
 
 # ==========================================
-# 2. GENERATE MOCK CSV (IF REAL ONE IS MISSING)
+# 2. LOCATE TELEMETRY CSV
 # ==========================================
 
-# finding the exact path between where this Python script is located and where the telemtry_dumps/telemetry_001.csv file is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
-csv_filename = os.path.join(script_dir, '..', 'telemetry_dumps', 'telemetry_001.csv')
-# create telemetry_dumps directory if it does not exist
-os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
+
+csv_filename = os.path.join(
+    script_dir,
+    "..",
+    "telemetry_dumps",
+    "telemetry_001.csv",
+)
 
 if not os.path.exists(csv_filename):
-    print(f"'{csv_filename}' not found. Generating a dummy CSV for testing...")
-    mock_data = {
-        'timestamp_ms': np.arange(1000, 101000, 1000), # 1 sec intervals
-        'current_mA': np.random.uniform(500, 5000, 100),
-        'voltage_mV': np.random.uniform(11000, 12600, 100),
-        'ax_x100': np.random.uniform(-200, 200, 100),
-        'ay_x100': np.random.uniform(-200, 200, 100),
-        'az_x100': np.random.uniform(-1000, -980, 100), # Gravity mostly
-        'amag_x100': np.random.uniform(980, 1020, 100),
-      #  'target_strategy': np.random.uniform(0, 1, 100) # What we want to predict
-    }
-    pd.DataFrame(mock_data).to_csv(csv_filename, index=False)
-
+    raise FileNotFoundError(
+        f"Telemetry file not found: {csv_filename}"
+    )
 # ==========================================
 # 3. LOAD, CLEAN, AND PREPROCESS CSV DATA (Incorporating Sandbox Logic)
 # TODO: compute input consumption (how much energy is used per second, in Watts/second)
 # ==========================================
 print("Loading data from CSV...")
+# validate data
 df = pd.read_csv(csv_filename)
-
-# a. Forward-fill any missing sensor data (From Sandbox #1)
-df.ffill(inplace=True)
+df = validate_telemetry(df, csv_filename)
 
 # b. Calculate parameters that is not be computed by hardware
     # b.i Power (From Sandbox concept #1)
         # TODO: Determine how hardware data is presented - currently assumes voltage and curent are in mV and mA, so divide by 1,000,000 to get Watts
-df['power_watts'] = (df['voltage_mV'] * df['current_mA']) / 1000000.0
-
+#convert into mV/mA 
+df["voltage_v"] = df["voltage_mV"] / 1000.0
+df["current_a"] = df["current_mA"] / 1000.0
+#calculate power
+df["power_watts"] = (
+    df["voltage_v"] * df["current_a"]
+)
     # b.ii Elaspsed time: subtract the very first timestamp from every timestamp
         # (Divide by 1000 to convert milliseconds to seconds)
 first_timestamp = df['timestamp_ms'].iloc[0]
@@ -96,7 +163,35 @@ df['energy_consumed_joules'] = (
     average_power_watts
     * df['delta_time_s']
 ).fillna(0.0)
+df["cumulative_energy_joules"] = (
+    df["energy_consumed_joules"].cumsum()
+)
+# BTW 1 Wh = 3,600 Joules
+df["cumulative_energy_wh"] = (
+    df["cumulative_energy_joules"] / 3600.0
+)
 
+measured_total_joules = (
+    df["cumulative_energy_joules"].iloc[-1]
+)
+
+measured_total_wh = (
+    df["cumulative_energy_wh"].iloc[-1]
+)
+
+print(f"Telemetry rows: {len(df)}")
+print(
+    f"Run duration: "
+    f"{df['elapsed_time_s'].iloc[-1]:.3f} seconds"
+)
+print(
+    f"Measured total energy: "
+    f"{measured_total_joules:.3f} J"
+)
+print(
+    f"Measured total energy: "
+    f"{measured_total_wh:.6f} Wh"
+)
 # The target for row i is the measured energy in the next interval.
 df['target_next_energy_joules'] = (
     df['energy_consumed_joules'].shift(-1)
