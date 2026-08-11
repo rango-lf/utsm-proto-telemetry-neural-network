@@ -3,6 +3,8 @@
 Run with python neuralNetwork/nn.py
 - TODO: translate telemetry data into static feature vector in the form of : [Speed, Accel, Slope, MotorTemp, ForceX, ForceY, WindResistance]
 """
+# TODO: predict *cumulative* energy consumption instead of per interval
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -164,6 +166,7 @@ print("Training complete. The network is ready to make predictions.")
 # ==========================================
 # Imagine a new line of telemetry just came in via CAN bus/serial
 # Order must match: [elapsed_time, current, voltage, power, energy, ax, ay, az, amag]
+# TODO: calculate the error with ACTUAL data and compute loss
 new_telemetry_raw = np.array([[102.0, 2500, 11800, 29.5, 1.47, 50, -10, -990, 1005]])
 
 # We MUST scale the new data using the EXACT SAME scaler we used for training
