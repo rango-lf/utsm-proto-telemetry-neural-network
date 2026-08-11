@@ -1,6 +1,9 @@
 # 
 """ Purpose: defines neural network through feedforward layer and uses gradient descent to train. Currently takes random inputs for training
-Run with python neuralNetwork/nn.py
+Run with python neuralNetwork/nn_gpsAndCsv.py
+- TODO: translate telemetry data into static feature vector in the form of : [Speed, Accel, Slope, MotorTemp, ForceX, ForceY, WindResistance]
+NOTE: this file parses both .csv and .gpx files
+-  Uses GPX data for physical features (speed, slope, aero drag)
 """
 import torch
 import torch.nn as nn
@@ -9,6 +12,14 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 import os
+import xml.etree.ElementTree as ET
+import math
+from datetime import datetime
+
+# --- Physics Constants ---
+rho_air = 1.225
+A_aero = 0.8
+coeff_aero_drag = 0.2
 
 #validate raw data and ensure that it is correct
 def validate_telemetry(df, source_name):
@@ -79,6 +90,53 @@ def validate_telemetry(df, source_name):
 
     return df
 
+def haversine(lat1, lon1, lat2, lon2):
+    """Calculate distance in meters between two GPS coordinates."""
+    R = 6371000 
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi, d_lambda = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(d_phi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda/2)**2
+    return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1-a)))
+
+def parse_gpx_to_features(gpx_filename):
+    """Parses GPX to DataFrame and calculates physics features."""
+    tree = ET.parse(gpx_filename)
+    root = tree.getroot()
+    ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
+    
+    data = []
+    for trkpt in root.findall('.//gpx:trkpt', ns):
+        lat = float(trkpt.attrib['lat'])
+        lon = float(trkpt.attrib['lon'])
+        ele = float(trkpt.find('gpx:ele', ns).text)
+        time_str = trkpt.find('gpx:time', ns).text
+        dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%SZ")
+        data.append({'time_dt': dt, 'lat': lat, 'lon': lon, 'ele': ele})
+        
+    df_gpx = pd.DataFrame(data)
+    if df_gpx.empty: return df_gpx
+    
+    # Normalize time to match CSV elapsed_time_s
+    df_gpx['elapsed_time_s'] = (df_gpx['time_dt'] - df_gpx['time_dt'].iloc[0]).dt.total_seconds()
+    
+    # Calculate Distances & Speed
+    df_gpx['dist_step_m'] = 0.0
+    for i in range(1, len(df_gpx)):
+        df_gpx.loc[i, 'dist_step_m'] = haversine(
+            df_gpx.loc[i-1, 'lat'], df_gpx.loc[i-1, 'lon'],
+            df_gpx.loc[i, 'lat'], df_gpx.loc[i, 'lon']
+        )
+        
+    df_gpx['dt'] = df_gpx['elapsed_time_s'].diff().fillna(1.0).replace(0, 1.0)
+    df_gpx['speed_mps'] = df_gpx['dist_step_m'] / df_gpx['dt']
+    
+    # Calculate Slope
+    df_gpx['ele_diff'] = df_gpx['ele'].diff().fillna(0)
+    # math.atan(y/x) - avoiding division by zero
+    df_gpx['slope_rad'] = np.arctan(df_gpx['ele_diff'] / df_gpx['dist_step_m'].replace(0, np.nan)).fillna(0)
+    
+    return df_gpx[['elapsed_time_s', 'speed_mps', 'slope_rad']]
+
 
 # ==========================================
 # 1. DEFINE THE ANN (FEEDFORWARD MLP)
@@ -121,6 +179,18 @@ csv_filename = os.path.join(
 if not os.path.exists(csv_filename):
     raise FileNotFoundError(
         f"Telemetry file not found: {csv_filename}"
+    )
+
+gpx_filename = os.path.join(
+    script_dir, 
+    "..", 
+    "telemetry_dumps", 
+    "telemetry_001.gpx"
+)
+
+if not os.path.exists(gpx_filename):
+    raise FileNotFoundError(
+        f"Telemetry file not found: {gpx_filename}"
     )
 # ==========================================
 # 3. LOAD, CLEAN, AND PREPROCESS CSV DATA (Incorporating Sandbox Logic)
@@ -207,6 +277,35 @@ feature_columns = [
     'ax_x100', 'ay_x100', 'az_x100', 'amag_x100'
 ]
 
+# --- MERGE GPX DATA IF IT EXISTS ---
+if os.path.exists(gpx_filename):
+    print("GPX file found! Parsing physics features...")
+    gpx_df = parse_gpx_to_features(gpx_filename)
+    
+    # Align high-frequency CSV data with 1Hz GPX data based on elapsed time.
+    # Assumes both data recorders were started at roughly the same time.
+    df = df.sort_values('elapsed_time_s')
+    gpx_df = gpx_df.sort_values('elapsed_time_s')
+    
+    # merge_asof fills the CSV rows with the most recent previous GPX row
+    df = pd.merge_asof(df, gpx_df, on='elapsed_time_s', direction='backward')
+    
+    # Backfill missing values for any early CSV rows before the first GPS lock
+    df['speed_mps'] = df['speed_mps'].bfill().fillna(0)
+    df['slope_rad'] = df['slope_rad'].bfill().fillna(0)
+    
+    # Calculate Aero Drag
+    df['aero_drag_N'] = 0.5 * rho_air * A_aero * coeff_aero_drag * (df['speed_mps'] ** 2)
+    
+    # Add new physics features to the input array
+    feature_columns.extend(['speed_mps', 'slope_rad', 'aero_drag_N'])
+else:
+    print("No GPX file found. Defaulting to raw telemetry.")
+
+df['target_next_energy_joules'] = df['energy_consumed_joules'].shift(-1)
+df = df.dropna(subset=['target_next_energy_joules']).reset_index(drop=True)
+
+
 # Extract the raw inputs (X) and the target we want to predict (y)
 # TODO: ensure actual CSV has a column for the target strategy
 X_raw = df[feature_columns].values
@@ -269,9 +368,11 @@ print("Training complete. The network is ready to make predictions.")
 # ==========================================
 # 6. MAKE A PREDICTION ON NEW DATA
 # ==========================================
-# Imagine a new line of telemetry just came in via CAN bus/serial
-# Order must match: [elapsed_time, current, voltage, power, energy, ax, ay, az, amag]
-new_telemetry_raw = np.array([[102.0, 2500, 11800, 29.5, 1.47, 50, -10, -990, 1005]])
+# Prediction array must dynamically match the size of feature_columns depending on if GPX was used.
+if 'speed_mps' in feature_columns:
+    new_telemetry_raw = np.array([[102.0, 2500, 11800, 29.5, 1.47, 50, -10, -990, 1005, 11.2, 0.05, 12.0]])
+else:
+    new_telemetry_raw = np.array([[102.0, 2500, 11800, 29.5, 1.47, 50, -10, -990, 1005]])
 
 # We MUST scale the new data using the EXACT SAME scaler we used for training
 new_telemetry_scaled = scaler.transform(new_telemetry_raw)
