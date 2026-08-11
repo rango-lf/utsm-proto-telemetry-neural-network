@@ -1,7 +1,8 @@
 # 
-""" Purpose: defines neural network through feedforward layer and uses gradient descent to train. Currently takes random inputs for training
+""" Purpose: defines neural network through feedforward layer and uses gradient descent to train.
+Parses all hardware CSV telemetyr files in a directory to build the training set.
+
 Run with python neuralNetwork/nn.py
-- TODO: translate telemetry data into static feature vector in the form of : [Speed, Accel, Slope, MotorTemp, ForceX, ForceY, WindResistance]
 """
 # TODO: predict *cumulative* energy consumption instead of per interval
 
@@ -12,6 +13,77 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 import os
+import glob
+
+#validate raw data and ensure that it is correct
+def validate_telemetry(df, source_name):
+    required_columns = [
+        "timestamp_ms",
+        "current_mA",
+        "voltage_mV",
+        "ax_x100",
+        "ay_x100",
+        "az_x100",
+        "amag_x100",
+    ]
+
+    if df.empty:
+        raise ValueError(f"{source_name}: file contains no telemetry rows")
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"{source_name}: missing required columns "
+            f"{missing_columns}"
+        )
+
+    if df.columns.duplicated().any():
+        duplicates = df.columns[df.columns.duplicated()].tolist()
+        raise ValueError(
+            f"{source_name}: duplicate columns {duplicates}"
+        )
+
+    for column in required_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    numeric_values = df[required_columns].to_numpy(
+        dtype=np.float64
+    )
+
+    invalid_rows = ~np.isfinite(numeric_values).all(axis=1)
+
+    if invalid_rows.any():
+        csv_rows = (df.index[invalid_rows] + 2).tolist()
+        raise ValueError(
+            f"{source_name}: missing or invalid values "
+            f"at CSV rows {csv_rows[:20]}"
+        )
+
+    if df["timestamp_ms"].duplicated().any():
+        raise ValueError(
+            f"{source_name}: timestamps contain duplicates"
+        )
+
+    if not df["timestamp_ms"].is_monotonic_increasing:
+        raise ValueError(
+            f"{source_name}: timestamps must be increasing"
+        )
+
+    if (df["voltage_mV"] <= 0).any():
+        raise ValueError(
+            f"{source_name}: voltage must be greater than zero"
+        )
+
+    return df
+
 
 # ==========================================
 # 1. DEFINE THE ANN (FEEDFORWARD MLP)
@@ -39,62 +111,117 @@ class TelemetryStrategyNet(nn.Module):
         return out
 
 # ==========================================
-# 2. GENERATE MOCK CSV (IF REAL ONE IS MISSING)
+# 2. LOCATE TELEMETRY CSV FILES
 # ==========================================
 
-# finding the exact path between where this Python script is located and where the telemtry_dumps/telemetry_001.csv file is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
-csv_filename = os.path.join(script_dir, '..', 'telemetry_dumps', 'telemetry_001.csv')
-# create telemetry_dumps directory if it does not exist
-os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
 
-if not os.path.exists(csv_filename):
-    print(f"'{csv_filename}' not found. Generating a dummy CSV for testing...")
-    mock_data = {
-        'timestamp_ms': np.arange(1000, 101000, 1000), # 1 sec intervals
-        'current_mA': np.random.uniform(500, 5000, 100),
-        'voltage_mV': np.random.uniform(11000, 12600, 100),
-        'ax_x100': np.random.uniform(-200, 200, 100),
-        'ay_x100': np.random.uniform(-200, 200, 100),
-        'az_x100': np.random.uniform(-1000, -980, 100), # Gravity mostly
-        'amag_x100': np.random.uniform(980, 1020, 100),
-        'target_strategy': np.random.uniform(0, 1, 100) # What we want to predict
-    }
-    pd.DataFrame(mock_data).to_csv(csv_filename, index=False)
+telemetry_dir = os.path.join(script_dir, "..", "telemetry_dumps")
 
+if not os.path.exists(telemetry_dir):
+    raise FileNotFoundError(f"Telemetry directory not found: {telemetry_dir}")
+
+# Find all CSV files in the directory
+csv_files = glob.glob(os.path.join(telemetry_dir, "*.csv"))
+
+if not csv_files:
+    raise FileNotFoundError(f"No .csv files found in directory: {telemetry_dir}")
+
+print(f"Found {len(csv_files)} telemetry files. Processing...")
 # ==========================================
 # 3. LOAD, CLEAN, AND PREPROCESS CSV DATA (Incorporating Sandbox Logic)
 # TODO: compute input consumption (how much energy is used per second, in Watts/second)
 # ==========================================
 print("Loading data from CSV...")
-df = pd.read_csv(csv_filename)
+all_run_dfs = []
 
-# a. Forward-fill any missing sensor data (From Sandbox #1)
-df.ffill(inplace=True)
+# Process each run independently so time-deltas and targets don't bleed across files
+for csv_filename in csv_files:
+    try:
 
-# b. Calculate parameters that is not be computed by hardware
-    # b.i Power (From Sandbox concept #1)
-        # TODO: Determine how hardware data is presented - currently assumes voltage and curent are in mV and mA, so divide by 1,000,000 to get Watts
-df['power_watts'] = (df['voltage_mV'] * df['current_mA']) / 1000000.0
+        df = pd.read_csv(csv_filename)
+        df = validate_telemetry(df, csv_filename)
 
-    # b.ii Elaspsed time: subtract the very first timestamp from every timestamp
-        # (Divide by 1000 to convert milliseconds to seconds)
-first_timestamp = df['timestamp_ms'].iloc[0]
-df['elapsed_time_s'] = (df['timestamp_ms'] - first_timestamp) / 1000.0
+        # b. Calculate parameters that is not be computed by hardware
+            # b.i Power (From Sandbox concept #1)
+                # TODO: Determine how hardware data is presented - currently assumes voltage and curent are in mV and mA, so divide by 1,000,000 to get Watts
+        #convert into mV/mA 
+        df["voltage_v"] = df["voltage_mV"] / 1000.0
+        df["current_a"] = df["current_mA"] / 1000.0
+        #calculate power
+        df["power_watts"] = (
+            df["voltage_v"] * df["current_a"]
+        )
+            # b.ii Elaspsed time: subtract the very first timestamp from every timestamp
+                # (Divide by 1000 to convert milliseconds to seconds)
+        first_timestamp = df['timestamp_ms'].iloc[0]
+        df['elapsed_time_s'] = (df['timestamp_ms'] - first_timestamp) / 1000.0
 
-    # b.iii: Delta0time: subtract the previous row's timestamp from the current row
-        # df['timestamp_ms'].diff() automatically does (Row_N - Row_N-1)
-df['delta_time_s'] = df['timestamp_ms'].diff() / 1000.0
-        # The very first row will have a NaN delta-time (since there is no previous row). Fill it with 0.
-df['delta_time_s'] = df['delta_time_s'].fillna(0)
-    # b.iv Energy consumption (Joules): Power (Watts) * Delta-Time (seconds)
-df['energy_consumed_joules'] = df['power_watts'] * df['delta_time_s']
+            # b.iii: Delta0time: subtract the previous row's timestamp from the current row
+                # df['timestamp_ms'].diff() automatically does (Row_N - Row_N-1)
+        df['delta_time_s'] = df['timestamp_ms'].diff() / 1000.0
+                # The very first row will have a NaN delta-time (since there is no previous row). Fill it with 0.
+        df['delta_time_s'] = df['delta_time_s'].fillna(0)
+            # b.iv Energy consumption (Joules): Power (Watts) * Delta-Time (seconds)
+        # Energy consumed between the previous row and the current row.
+        average_power_watts = (
+            df['power_watts']
+            + df['power_watts'].shift(1)
+        ) / 2.0
 
-# c. Generate dummy answers if missing
-if 'target_strategy' not in df.columns:
-    print("\n[WARNING]: 'target_strategy' column not found in CSV.")
-    print("Generating a dummy target column so training can proceed...\n")
-    df['target_strategy'] = np.random.uniform(0, 1, len(df))
+        df['energy_consumed_joules'] = (
+            average_power_watts
+            * df['delta_time_s']
+        ).fillna(0.0)
+        df["cumulative_energy_joules"] = (
+            df["energy_consumed_joules"].cumsum()
+        )
+        # BTW 1 Wh = 3,600 Joules
+        df["cumulative_energy_wh"] = (
+            df["cumulative_energy_joules"] / 3600.0
+        )
+
+        measured_total_joules = (
+            df["cumulative_energy_joules"].iloc[-1]
+        )
+
+        measured_total_wh = (
+            df["cumulative_energy_wh"].iloc[-1]
+        )
+
+        # The target for row i is the measured energy in the next interval.
+        df['target_next_energy_joules'] = (
+            df['energy_consumed_joules'].shift(-1)
+        )
+
+        # The final row has no future interval, so it cannot be used for training.
+        df = df.dropna(
+            subset=['target_next_energy_joules']
+        ).reset_index(drop=True)
+        all_run_dfs.append(df)
+        print(f" - Processed {os.path.basename(csv_filename)}: {len(df)} valid rows.")
+        print(f"\tTelemetry rows: {len(df)}")
+        print(
+            f"\tRun duration: "
+            f"\t{df['elapsed_time_s'].iloc[-1]:.3f} seconds"
+        )
+        print(
+            f"\tMeasured total energy: "
+            f"\t{measured_total_joules:.3f} J"
+        )
+        print(
+            f"\tMeasured total energy: "
+            f"\t{measured_total_wh:.6f} Wh"
+        )
+        
+    except Exception as e:
+        print(f" - Skipped {os.path.basename(csv_filename)} due to error: {e}")
+if not all_run_dfs:
+    raise ValueError("No valid telemetry data could be processed from the directory.")
+
+# Combine all processed runs into a single dataset for training
+combined_df = pd.concat(all_run_dfs, ignore_index=True)
+print(f"\nTotal dataset size: {len(combined_df)} rows.\n")
 
 # d. define exact input features
 feature_columns = [
@@ -104,8 +231,8 @@ feature_columns = [
 
 # Extract the raw inputs (X) and the target we want to predict (y)
 # TODO: ensure actual CSV has a column for the target strategy
-X_raw = df[feature_columns].values
-y_raw = df['target_strategy'].values
+X_raw = combined_df[feature_columns].values
+y_raw = combined_df['target_next_energy_joules'].values
 
 # CRITICAL STEP: Scale the features so they all have a mean of 0 and variance of 1
 scaler = StandardScaler()
@@ -119,8 +246,8 @@ y_train = torch.tensor(y_raw, dtype=torch.float32).view(-1, 1) # Reshape to a co
 # 4. SETUP HYPERPARAMETERS
 # ==========================================
 # assume static feature vector has 8 variables: 'elapsed_time_s', 'current_mA', 'voltage_mV', 'power_watts', 'energy_consumed_joules', 'ax_x100', 'ay_x100', 'az_x100', 'amag_x100' --> = revised columns of data from telemetry_dumps + power + energy consumed
-INPUT_FEATURES = 9
-# Let's assume 'strategy' is a single continuous value (e.g., Target Throttle %)
+INPUT_FEATURES = len(feature_columns) # calculates length based on the # of input names
+# The output is predicted next-interval energy in joules.
 OUTPUT_FEATURES = 1 
 HIDDEN_NEURONS = 32
 LEARNING_RATE = 0.005
@@ -174,7 +301,13 @@ new_telemetry_scaled = scaler.transform(new_telemetry_raw)
 
 # Convert to tensor and predict
 new_tensor = torch.tensor(new_telemetry_scaled, dtype=torch.float32)
-predicted_strategy = model(new_tensor)
+model.eval()
+
+with torch.no_grad():
+    predicted_next_energy = model(new_tensor)
 
 print(f"New raw input: {new_telemetry_raw[0]}")
-print(f"Predicted Strategy Output: {predicted_strategy.item():.4f}")
+print(
+    f"Predicted next-interval energy: "
+    f"{predicted_next_energy.item():.4f} J"
+)
